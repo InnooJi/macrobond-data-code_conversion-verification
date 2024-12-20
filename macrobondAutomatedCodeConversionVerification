@@ -1,0 +1,152 @@
+import macrobond_data_api as mda
+import pandas as pd
+import openpyxl
+from datetime import datetime
+from macrobond_data_api.common.types import GetEntitiesError
+import math
+from termcolor import cprint
+
+# Fetch weekly series by resampling
+
+def fetch_weekly_series(series_name):
+    try:
+        print(f"Fetching data for series {series_name}...")
+        series_data = mda.get_one_series(series_name)
+        data_frame = series_data.values_to_pd_data_frame()
+        # Resample to weekly frequency, assuming week ends on Friday
+        data_frame['date'] = pd.to_datetime(data_frame['date'])
+        weekly_series = data_frame.resample('W-FRI', on='date').last().reset_index()
+        return weekly_series
+    except GetEntitiesError:
+        print(f"Series {series_name} not found in the Macrobond database.")
+        return None
+    except Exception as e:
+        print(f"Error fetching series {series_name}: {e}")
+        return None
+
+# Compare values with better logging and unit conversion
+
+def compare_values(value1, value2, tolerance=1e-2):
+    try:
+        if pd.isna(value1) or pd.isna(value2):
+            return True
+
+        if value1 == 0 or value2 == 0:
+            return math.isclose(value1, value2, rel_tol=tolerance)
+
+        log_diff = abs(math.log10(abs(value1)) - math.log10(abs(value2)))
+        if log_diff > 3:  # Adjust for unit conversion differences
+            if value1 > value2:
+                value2 *= 10 ** round(log_diff)
+            else:
+                value1 *= 10 ** round(log_diff)
+
+        return math.isclose(value1, value2, rel_tol=tolerance)
+    except Exception as e:
+        print(f"Error in compare_values: {e}")
+        return False
+
+# Verify weekly data in the workbook
+
+def verify_weekly_macrobond_codes(workbook_path, frequency_sheet_name, all_teams_sheet_name):
+    try:
+        wb = openpyxl.load_workbook(workbook_path)
+    except Exception as e:
+        print(f"Error loading workbook: {e}")
+        return
+
+    freq_sheet = wb[frequency_sheet_name]
+    all_teams_sheet = wb[all_teams_sheet_name]
+
+    results = []
+
+    for row in freq_sheet.iter_rows(min_row=2, max_col=2, values_only=True):
+        foreign_code, macrobond_code = row
+
+        if not foreign_code or not macrobond_code:
+            continue
+
+        print(f"\nVerifying {foreign_code} mapped to {macrobond_code}...")
+        recent_series = fetch_weekly_series(macrobond_code)
+
+        if recent_series is None or 'date' not in recent_series or 'value' not in recent_series:
+            print(f"Data for series {macrobond_code} is missing required columns or not retrieved.")
+            results.append((foreign_code, macrobond_code, "Data retrieval error", 0))
+            continue
+
+        recent_series['date'] = pd.to_datetime(recent_series['date']).dt.date
+
+        for col in all_teams_sheet.iter_cols(min_row=1, max_col=all_teams_sheet.max_column):
+            for cell in col:
+                if cell.value and "DATASTREAM:" in str(cell.value) and foreign_code in str(cell.value):
+                    col_idx = cell.column
+                    all_teams_dates = [all_teams_sheet.cell(row=r, column=1).value for r in range(6, all_teams_sheet.max_row + 1)]
+                    all_teams_values = [all_teams_sheet.cell(row=r, column=col_idx).value for r in range(6, all_teams_sheet.max_row + 1)]
+
+                    all_teams_data = {pd.to_datetime(d).date(): v for d, v in zip(all_teams_dates, all_teams_values) if v is not None}
+
+                    correct_matches = 0
+                    total_checks = len(all_teams_data)
+
+                    for date, value in all_teams_data.items():
+                        recent_value = recent_series.loc[recent_series['date'] == date, 'value']
+
+                        if not recent_value.empty:
+                            match = compare_values(value, recent_value.values[0])
+                            if match:
+                                correct_matches += 1
+                            else:
+                                print(f"Mismatch for {foreign_code} on {date}: Expected {value}, Got {recent_value.values[0]}")
+
+                    accuracy = (correct_matches / total_checks) * 100 if total_checks > 0 else 0
+
+                    if accuracy >= 80:
+                        results.append((foreign_code, macrobond_code, "Success", accuracy))
+                        cprint(f"Success: {accuracy:.2f}% match for {foreign_code}", "green")
+                    else:
+                        results.append((foreign_code, macrobond_code, "Mismatch", accuracy))
+                        cprint(f"Mismatch: {accuracy:.2f}% match for {foreign_code}", "red")
+
+                    break
+            else:
+                continue
+            break
+        else:
+            print(f"Foreign code {foreign_code} not found in {all_teams_sheet_name}.")
+            results.append((foreign_code, macrobond_code, "Foreign code not found", 0))
+
+    results_sheet_name = f"{frequency_sheet_name} Results"
+    if results_sheet_name in wb.sheetnames:
+        del wb[results_sheet_name]
+    results_sheet = wb.create_sheet(results_sheet_name)
+
+    results_sheet.append(["Foreign Code", "Macrobond Code", "Status", "Accuracy (%)"])
+    for result in results:
+        results_sheet.append(result)
+
+    wb.save(workbook_path)
+    wb.close()
+
+    print("Verification complete. Results saved.")
+
+# Main execution
+
+def main():
+    workbook_path = input("Enter the path to your workbook: ").strip()
+    wb = openpyxl.load_workbook(workbook_path)
+    sheet_names = wb.sheetnames
+
+    frequencies = ["WEEKLY"]  # Change this to include other frequencies if needed
+
+    for frequency in frequencies:
+        frequency_sheet_name = frequency
+        all_teams_sheet_name = f"ALL TEAMS - {frequency[0]}"
+
+        if frequency_sheet_name in sheet_names and all_teams_sheet_name in sheet_names:
+            print(f"Processing {frequency_sheet_name} and {all_teams_sheet_name}...")
+            verify_weekly_macrobond_codes(workbook_path, frequency_sheet_name, all_teams_sheet_name)
+        else:
+            print(f"Skipping {frequency_sheet_name} as sheets are missing.")
+
+if __name__ == "__main__":
+    main()
